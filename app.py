@@ -401,5 +401,10 @@ with gr.Blocks(css=custom_stylesheet, title="VERTADRAW - Nhận diện nét vẽ
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    # Thêm .queue() vào trước .launch() để chống lỗi API Not Found trên đám mây
-    demo.queue().launch(server_name="0.0.0.0", server_port=port, share=False)
+    # root_path="" giúp Gradio tự tìm đúng đường dẫn API trên Proxy của Render
+    demo.queue().launch(
+        server_name="0.0.0.0", 
+        server_port=port, 
+        root_path=os.environ.get("RENDER_EXTERNAL_URL", ""),
+        share=False
+    )
