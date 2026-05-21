@@ -204,4 +204,6 @@ with gr.Blocks(css=custom_stylesheet, title="VERTADRAW - Nhận diện nét vẽ
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port)
+    print(f"🚀 [HỆ THỐNG] Đang chuẩn bị mở cổng {port}...")
+    # Tắt share để nhẹ máy, Render đã tự cấp link web cho bạn rồi
+    demo.launch(server_name="0.0.0.0", server_port=port, share=False)
