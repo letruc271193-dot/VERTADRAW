@@ -399,9 +399,7 @@ with gr.Blocks(css=custom_stylesheet, title="VERTADRAW - Nhận diện nét vẽ
         js="() => { setTimeout(() => { window.dispatchEvent(new Event('resize')); }, 150); }"
     )
 
-# --- CẤU HÌNH ĐỂ CHẠY TRÊN RENDER HOẶC MÁY TÍNH ---
 if __name__ == "__main__":
-    # Lấy cổng (Port) từ môi trường Render, nếu không có thì mặc định lấy 7860
     port = int(os.environ.get("PORT", 7860))
-    # Chạy server với host 0.0.0.0 để mở public
-    demo.launch(server_name="0.0.0.0", server_port=port)
+    # Thêm .queue() vào trước .launch() để chống lỗi API Not Found trên đám mây
+    demo.queue().launch(server_name="0.0.0.0", server_port=port, share=False)
