@@ -2,12 +2,18 @@ import os
 import cv2
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
 import gradio as gr
 from PIL import Image
+import urllib.request
 
-# Ép hệ thống chạy bằng CPU để tiết kiệm RAM trên Render
-device = torch.device("cpu")
+opener = urllib.request.build_opener()
+opener.addheaders = [('User-agent', 'Mozilla/5.0')]
+urllib.request.install_opener(opener)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_PATH = "fashion_ann_quickdraw.pth"
 
 CATEGORIES = [
@@ -49,22 +55,132 @@ class FashionANN(nn.Module):
         x = x.view(x.size(0), -1)
         return self.network(x)
 
-def load_model():
-    print("[HỆ THỐNG] Khởi tạo mô hình ANN...")
+def download_quickdraw_subset(category, num_samples=3000):
+    url = f"https://storage.googleapis.com/quickdraw_dataset/full/numpy_bitmap/{category}.npy"
+    bytes_to_fetch = num_samples * 784 + 1024
+    req = urllib.request.Request(url)
+    req.add_header('Range', f'bytes=0-{bytes_to_fetch}')
+    req.add_header('User-Agent', 'Mozilla/5.0')
+
+    try:
+        print(f"   [+] Đang tải nhanh dữ liệu vẽ tay mẫu của: '{category}'...")
+        with urllib.request.urlopen(req) as response:
+            content = response.read()
+
+        magic = content[:6]
+        if magic != b'\x93NUMPY':
+            raise ValueError("Không khớp chữ ký file npy của NumPy.")
+
+        major = content[6]
+        if major == 1:
+            header_len = int.from_bytes(content[8:10], byteorder='little')
+            header_start = 10
+        elif major == 2:
+            header_len = int.from_bytes(content[8:12], byteorder='little')
+            header_start = 12
+        else:
+            raise ValueError("Phiên bản định dạng NumPy không được hỗ trợ.")
+
+        raw_start = header_start + header_len
+        raw_data = content[raw_start:]
+
+        arr = np.frombuffer(raw_data, dtype=np.uint8)
+        num_imgs = len(arr) // 784
+        arr = arr[:num_imgs * 784].reshape(num_imgs, 784)
+
+        return arr[:num_samples]
+    except Exception as e:
+        print(f"   [!] Gặp lỗi Range Request cho {category}: {e}. Chuyển sang tải truyền thống...")
+
+        os.makedirs("temp_data", exist_ok=True)
+        fallback_path = f"temp_data/{category}.npy"
+        urllib.request.urlretrieve(url, fallback_path)
+        arr = np.load(fallback_path)[:num_samples]
+        if os.path.exists(fallback_path):
+            os.remove(fallback_path)
+        return arr
+
+def initialize_and_train():
     model = FashionANN().to(device)
 
-    # Nếu không có file, báo lỗi ngay lập tức để lập trình viên biết
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"🚨 LỖI TRÍ MẠNG: Không tìm thấy file '{MODEL_PATH}'! Chắc chắn bạn chưa upload file này lên GitHub hoặc sai tên file (chú ý chữ hoa/thường).")
+    if os.path.exists(MODEL_PATH):
+        print("[HỆ THỐNG] Phát hiện trọng số ANN vẽ tay đã lưu! Đang tiến hành nạp vào mô hình...")
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+        model.eval()
+        return model
 
-    print(f"[HỆ THỐNG] Đã tìm thấy '{MODEL_PATH}', đang nạp trọng số...")
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    print("[HỆ THỐNG] Không tìm thấy mô hình có sẵn. Bắt đầu huấn luyện...")
+    # Quá trình huấn luyện (Sẽ bị bỏ qua nếu bạn đã upload file .pth lên GitHub)
+    all_images = []
+    all_labels = []
+    samples_per_class = 50000
+
+    for idx, category in enumerate(CATEGORIES):
+        class_data = download_quickdraw_subset(category, num_samples=samples_per_class)
+        all_images.append(class_data)
+        all_labels.append(np.full(len(class_data), idx))
+
+    X = np.concatenate(all_images, axis=0).astype(np.float32) / 255.0
+    y = np.concatenate(all_labels, axis=0)
+
+    indices = np.arange(len(X))
+    np.random.shuffle(indices)
+    X, y = X[indices], y[indices]
+
+    split_idx = int(len(X) * 0.85)
+    X_train, X_val = X[:split_idx], X[split_idx:]
+    y_train, y_val = y[:split_idx], y[split_idx:]
+
+    train_dataset = TensorDataset(torch.tensor(X_train), torch.tensor(y_train, dtype=torch.long))
+    val_dataset = TensorDataset(torch.tensor(X_val), torch.tensor(y_val, dtype=torch.long))
+
+    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-3)
+
+    epochs = 20
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        correct_train = 0
+        total_train = 0
+
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total_train += labels.size(0)
+            correct_train += (predicted == labels).sum().item()
+
+        model.eval()
+        correct_val = 0
+        total_val = 0
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                _, predicted = torch.max(outputs.data, 1)
+                total_val += labels.size(0)
+                correct_val += (predicted == labels).sum().item()
+
+        train_acc = 100 * correct_train / total_train
+        val_acc = 100 * correct_val / total_val
+        print(f"   => Epoch {epoch+1:02d}/{epochs:02d} | Loss: {running_loss/len(train_loader):.4f} | Accuracy: {train_acc:.2f}% | Val Accuracy: {val_acc:.2f}%")
+
+    torch.save(model.state_dict(), MODEL_PATH)
+    print(f"[HỆ THỐNG] Đã lưu mô hình tại: '{MODEL_PATH}'")
     model.eval()
-    print("[HỆ THỐNG] Nạp mô hình thành công! Sẵn sàng nhận diện.")
     return model
 
-# Gọi hàm load model
-model = load_model()
+model = initialize_and_train()
 
 def preprocess_and_predict(image_data):
     if image_data is None or 'composite' not in image_data:
@@ -132,21 +248,102 @@ def navigate_back():
     return gr.update(visible=True), gr.update(visible=False), gr.update(value=blank_canvas)
 
 custom_stylesheet = """
-body { background-color: #F8FAFC !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important; }
-.gradio-container { max-width: 480px !important; margin: 0 auto !important; padding: 16px !important; border-radius: 20px !important; background-color: #FFFFFF !important; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.04) !important; border: 1px solid #E2E8F0 !important; }
-.app-header { text-align: center; margin-bottom: 12px; }
-.app-title { font-size: 22px !important; font-weight: 800 !important; background: linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%) !important; -webkit-background-clip: text !important; -webkit-text-fill-color: transparent !important; margin-bottom: 6px !important; }
-.app-subtitle { font-size: 13px !important; color: #64748B !important; }
-.action-button { background: linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%) !important; color: #FFFFFF !important; font-weight: 700 !important; font-size: 16px !important; border-radius: 12px !important; padding: 12px !important; border: none !important; cursor: pointer; box-shadow: 0 4px 10px rgba(79, 70, 229, 0.25) !important; transition: all 0.2s ease !important; }
-.action-button:active { transform: scale(0.97) !important; }
-.back-button { background-color: #F1F5F9 !important; color: #475569 !important; border: 1px solid #E2E8F0 !important; font-weight: 600 !important; font-size: 13px !important; border-radius: 8px !important; padding: 6px 14px !important; }
-.result-card { background: #F8FAFC; padding: 14px; border-radius: 12px; margin-bottom: 12px; border: 1px solid #E2E8F0; }
-.result-meta { display: flex; align-items: center; margin-bottom: 6px; }
-.rank-badge { color: #FFFFFF; font-size: 10px; font-weight: 800; padding: 2px 6px; border-radius: 999px; margin-right: 8px; }
-.class-name { font-size: 14px; font-weight: 700; color: #0F172A; }
-.fuzzy-info { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px; }
-.progress-track { background-color: #E2E8F0; height: 8px; border-radius: 999px; width: 100%; overflow: hidden; }
-.progress-bar { height: 100%; border-radius: 999px; transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1); }
+body {
+    background-color: #F8FAFC !important;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+}
+.gradio-container {
+    max-width: 480px !important;
+    margin: 0 auto !important;
+    padding: 16px !important;
+    border-radius: 20px !important;
+    background-color: #FFFFFF !important;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.04) !important;
+    border: 1px solid #E2E8F0 !important;
+}
+.app-header {
+    text-align: center;
+    margin-bottom: 12px;
+}
+.app-title {
+    font-size: 22px !important;
+    font-weight: 800 !important;
+    background: linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%) !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+    margin-bottom: 6px !important;
+}
+.app-subtitle {
+    font-size: 13px !important;
+    color: #64748B !important;
+}
+.action-button {
+    background: linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%) !important;
+    color: #FFFFFF !important;
+    font-weight: 700 !important;
+    font-size: 16px !important;
+    border-radius: 12px !important;
+    padding: 12px !important;
+    border: none !important;
+    cursor: pointer;
+    box-shadow: 0 4px 10px rgba(79, 70, 229, 0.25) !important;
+    transition: all 0.2s ease !important;
+}
+.action-button:active {
+    transform: scale(0.97) !important;
+}
+.back-button {
+    background-color: #F1F5F9 !important;
+    color: #475569 !important;
+    border: 1px solid #E2E8F0 !important;
+    font-weight: 600 !important;
+    font-size: 13px !important;
+    border-radius: 8px !important;
+    padding: 6px 14px !important;
+}
+.result-card {
+    background: #F8FAFC;
+    padding: 14px;
+    border-radius: 12px;
+    margin-bottom: 12px;
+    border: 1px solid #E2E8F0;
+}
+.result-meta {
+    display: flex;
+    align-items: center;
+    margin-bottom: 6px;
+}
+.rank-badge {
+    color: #FFFFFF;
+    font-size: 10px;
+    font-weight: 800;
+    padding: 2px 6px;
+    border-radius: 999px;
+    margin-right: 8px;
+}
+.class-name {
+    font-size: 14px;
+    font-weight: 700;
+    color: #0F172A;
+}
+.fuzzy-info {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    margin-bottom: 4px;
+}
+.progress-track {
+    background-color: #E2E8F0;
+    height: 8px;
+    border-radius: 999px;
+    width: 100%;
+    overflow: hidden;
+}
+.progress-bar {
+    height: 100%;
+    border-radius: 999px;
+    transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+}
 """
 
 blank_canvas = Image.new("RGBA", (450, 450), (255, 255, 255, 255))
@@ -202,8 +399,9 @@ with gr.Blocks(css=custom_stylesheet, title="VERTADRAW - Nhận diện nét vẽ
         js="() => { setTimeout(() => { window.dispatchEvent(new Event('resize')); }, 150); }"
     )
 
+# --- CẤU HÌNH ĐỂ CHẠY TRÊN RENDER HOẶC MÁY TÍNH ---
 if __name__ == "__main__":
+    # Lấy cổng (Port) từ môi trường Render, nếu không có thì mặc định lấy 7860
     port = int(os.environ.get("PORT", 7860))
-    print(f"🚀 [HỆ THỐNG] Đang chuẩn bị mở cổng {port}...")
-    # Tắt share để nhẹ máy, Render đã tự cấp link web cho bạn rồi
-    demo.launch(server_name="0.0.0.0", server_port=port, share=False)
+    # Chạy server với host 0.0.0.0 để mở public
+    demo.launch(server_name="0.0.0.0", server_port=port)
